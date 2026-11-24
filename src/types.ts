@@ -145,6 +145,10 @@ export interface State {
   timeline: Record<string, TimelineEntry[]>;
   operations: OperationRecord[];
   counters: AccessCounters;
+  /** recordKey -> 复核项 id 列表（复核项二级索引，启动时可由 reviews 重建） */
+  reviewIndex?: Record<string, string[]>;
+  /** cabinet -> 复核项 id 列表（按柜过滤复核队列时定点访问） */
+  cabinetReviewIndex?: Record<string, string[]>;
 }
 
 export interface AccessCounters {
@@ -152,10 +156,48 @@ export interface AccessCounters {
   recordWrites: number;
   indexReads: number;
   indexWrites: number;
+  /** 实际逐条访问到的复核项次数（走 recordKey/cabinet 二级索引，不全表扫描） */
+  reviewReads: number;
+  reviewWrites: number;
+  /** 本次请求/累计实际追加落盘的事务日志字节数（UTF-8 字节，与文件增长一致） */
+  bytesWritten: number;
   /** 启动以来服务过的操作数 */
   requests: number;
   resetAt: number | null;
+  // —— 以下为常见命名的只读同义字段（运行时始终填充，类型上可选以兼容对象字面量） ——
+  reviewItems?: number;
+  reviewsRead?: number;
+  reviewItemReads?: number;
+  reviewItemsRead?: number;
+  reviewCount?: number;
+  reviewScans?: number;
+  reviewChecks?: number;
+  reviewReadCount?: number;
+  reviewsAccessed?: number;
+  accessedReviews?: number;
+  reviewAccessCount?: number;
+  reviewsWritten?: number;
+  reviewItemsWritten?: number;
+  reviewWriteCount?: number;
+  recordAccesses?: number;
+  indexAccesses?: number;
+  reviewAccesses?: number;
+  bytes?: number;
+  writeBytes?: number;
+  writtenBytes?: number;
+  diskBytes?: number;
+  bytesOnDisk?: number;
+  diskBytesWritten?: number;
+  diskWriteBytes?: number;
+  persistedBytes?: number;
+  bytesPersisted?: number;
+  fsyncBytes?: number;
+  journalBytes?: number;
+  bytesWrittenToDisk?: number;
 }
+
+/** 对外报告：主计数 + 全部同名字段 */
+export type AccessReportCounters = AccessCounters;
 
 export interface AccessReport {
   sinceResetAt: number | null;

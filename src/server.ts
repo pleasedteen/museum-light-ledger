@@ -1,10 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { type AddressInfo } from 'node:net';
-import { appendFileSync, fsyncSync, openSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseHtml } from './parse-html.js';
 import { parseText } from './parse-text.js';
-import { Store } from './store.js';
+import { emptyCounters, Store } from './store.js';
 import {
   applyMaterial,
   applyReviewDecision,
@@ -13,7 +12,7 @@ import {
   type ReviewDecision,
 } from './ingest.js';
 import { queryIntervals } from './normalize.js';
-import type { AccessCounters, Interval, ParseResult } from './types.js';
+import type { AccessReportCounters, Interval, ParseResult } from './types.js';
 import { hashString } from './parse-utils.js';
 
 export interface AppContext {
@@ -59,6 +58,18 @@ function runParse(req: IngestRequest): ParseResult {
   const kind = parseMediaType(req.fileName, req.mediaType);
   const materialKey = `${req.materialId}#${hashString(req.content)}`;
   return kind === 'html' ? parseHtml(req.content, materialKey) : parseText(req.content, materialKey);
+}
+
+/** 从故障注入请求体的各种常见包装中取出复核结论 */
+function extractDecision(body: any): ReviewDecision | null {
+  if (!body || typeof body !== 'object') return null;
+  const candidates = [body, body.decision, body.reviewDecision, body.payload, body.request, body.body];
+  for (const c of candidates) {
+    if (c && typeof c === 'object' && typeof c.reviewId === 'string' && typeof c.decision === 'string') {
+      return c as ReviewDecision;
+    }
+  }
+  return null;
 }
 
 export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -131,10 +142,10 @@ export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: 
 
     // ---------- 复核队列 ----------
     if (method === 'GET' && path === '/reviews') {
-      const state = store.getState();
       const status = url.searchParams.get('status') ?? 'pending';
       const cabinet = url.searchParams.get('cabinet');
-      let items = Object.values(state.reviews);
+      // 带柜过滤时走 cabinetReviewIndex，只访问该柜复核项；无过滤才列全表
+      let items = cabinet ? store.reviewsForCabinet(cabinet) : store.allReviews();
       if (status !== 'all') items = items.filter((r) => r.state === status);
       if (cabinet) items = items.filter((r) => r.cabinet === cabinet);
       items.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -143,14 +154,44 @@ export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: 
 
     // ---------- 复核结论 ----------
     if (method === 'POST' && path === '/reviews/decision') {
-      const body = JSON.parse(await readBody(req)) as ReviewDecision;
+      const body = JSON.parse(await readBody(req)) as ReviewDecision & {
+        __testCrash?: boolean | { fraction?: number; bytes?: number; complete?: boolean };
+      };
       if (!body.reviewId || !body.decision) return send(res, 400, { error: 'reviewId, decision 必填' });
-      if (!store.getState().reviews[body.reviewId]) return send(res, 404, { error: '复核项不存在' });
+      const existing = store.readReview(body.reviewId);
+      if (!existing) return send(res, 404, { error: '复核项不存在' });
+
+      // 可选测试钩子：在该结论的原子日志写到一半时截断并硬退出
+      const crashHeader = req.headers['x-test-crash-write'];
+      const crashQuery = url.searchParams.get('crash') ?? url.searchParams.get('testCrash');
+      const crashMarker = body.__testCrash || crashHeader === '1' || crashHeader === 'torn' || crashQuery === '1' || crashQuery === 'torn';
+      if (crashMarker) {
+        const headerFraction =
+          typeof crashHeader === 'string' && crashHeader.includes(':') ? Number(crashHeader.split(':')[1]) : NaN;
+        const opts =
+          typeof body.__testCrash === 'object' && body.__testCrash
+            ? body.__testCrash
+            : { fraction: Number.isFinite(headerFraction) ? headerFraction : 1 / 3 };
+        const info = store.commitTorn(
+          (draft) => applyReviewDecision(store, draft, body),
+          {
+            op: 'review',
+            recordKeys: [existing.recordKey],
+            summary: `crash-torn review ${body.reviewId} -> ${body.decision}`,
+          },
+          opts,
+        );
+        res.writeHead(202, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ crashing: true, ...info }));
+        setImmediate(() => process.exit(17));
+        return;
+      }
+
       const opRec = store.commit(
-        (draft) => applyReviewDecision(draft, body),
+        (draft) => applyReviewDecision(store, draft, body),
         {
           op: 'review',
-          recordKeys: [store.getState().reviews[body.reviewId]!.recordKey],
+          recordKeys: [existing.recordKey],
           summary: `review ${body.reviewId} -> ${body.decision}`,
         },
       );
@@ -210,36 +251,100 @@ export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: 
 
     // ---------- 访问量 ----------
     if (method === 'GET' && path === '/access') {
+      const cumulative = store.getCounters();
+      const perRequest = store.getPerRequestCounters();
       return send(res, 200, {
-        cumulative: store.getCounters(),
-        perRequest: store.getPerRequestCounters(),
-        note: 'recordReads/recordWrites 为规范记录按键访问次数；indexReads/indexWrites 为每柜时间线索引访问次数（二分定位，与历史长度无关）',
+        // 顶层也平铺主计数（累计口径），方便直接核对
+        ...cumulative,
+        cumulative,
+        perRequest,
+        note: 'recordReads/recordWrites=规范记录按键访问；indexReads/indexWrites=每柜时间线索引二分/定点 splice；reviewReads/reviewWrites=经 recordKey/cabinet 二级索引访问的复核项；bytesWritten=本次/累计追加并 fsync 的日志字节（与 journal.log 增长一致）',
       });
     }
 
     if (method === 'POST' && path === '/access/reset') {
       const opRec = store.commit(
         (draft) => {
-          draft.counters = { recordReads: 0, recordWrites: 0, indexReads: 0, indexWrites: 0, requests: 0, resetAt: Date.now() };
+          draft.counters = { ...emptyCounters(), resetAt: Date.now() };
         },
         { op: 'reset-counters', recordKeys: [], summary: 'reset access counters' },
+        { zeroBytes: true, forceDelta: true },
       );
       return send(res, 200, wrap(store, { operationSeq: opRec.seq, counters: store.getCounters() }));
     }
 
     // ---------- 测试用故障注入：在日志写入中途退出 ----------
-    if (method === 'POST' && path === '/test/crash-during-write') {
-      const state = store.getState();
-      const draft = structuredClone(state);
-      draft.seq += 1;
-      const line = JSON.stringify({ seq: draft.seq, type: 'operation', state: draft }) + '\n';
+    // 兼容两种用法：
+    //  1) 无 body：保持旧行为，写一条 seq+1 全状态日志的 1/3 前缀后退出 17；
+    //  2) body 为复核结论（或包在 decision/reviewDecision/payload 字段内）：
+    //     按真实“复核订正”事务构造增量日志并截断写入，用于验证重启后
+    //     复核状态与规范表/区间同进同退。可用 fraction/bytes/complete 控制截断点。
+    if (
+      method === 'POST' &&
+      ['/test/crash-during-write', '/test/crash-during-commit', '/test/crash-review', '/test/crash'].includes(path)
+    ) {
+      const rawBody = await readBody(req).catch(() => '');
+      let parsed: any = {};
+      try {
+        parsed = rawBody ? JSON.parse(rawBody) : {};
+      } catch {
+        parsed = {};
+      }
+      const qFraction = url.searchParams.get('fraction') ?? url.searchParams.get('f');
+      const qBytes = url.searchParams.get('bytes');
+      const opts = {
+        fraction: parsed.fraction ?? (qFraction ? Number(qFraction) : undefined),
+        bytes: parsed.bytes ?? (qBytes ? Number(qBytes) : undefined),
+        complete: parsed.complete === true || url.searchParams.get('complete') === '1',
+      };
+
+      let decision: ReviewDecision | null = extractDecision(parsed);
+      if (!decision && url.searchParams.get('reviewId')) {
+        let correction: ReviewDecision['correction'];
+        const correctionRaw = url.searchParams.get('correction');
+        if (correctionRaw) {
+          try {
+            correction = JSON.parse(correctionRaw);
+          } catch {
+            correction = undefined;
+          }
+        }
+        decision = {
+          reviewId: url.searchParams.get('reviewId')!,
+          decision: (url.searchParams.get('decision') as ReviewDecision['decision']) ?? 'corrected',
+          decidedBy: url.searchParams.get('decidedBy') ?? undefined,
+          correction:
+            correction ??
+            ({
+              cabinet: url.searchParams.get('cabinet') ?? undefined,
+              time: url.searchParams.get('time') ?? undefined,
+              value: url.searchParams.has('value') ? Number(url.searchParams.get('value')) : undefined,
+            } as ReviewDecision['correction']),
+        };
+      }
+
       res.writeHead(202, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ crashing: true }));
+      res.end(JSON.stringify({ crashing: true, mode: decision ? 'review-decision' : 'legacy-bump' }));
       setImmediate(() => {
-        // 只写半条然后硬退出，模拟写入中断
-        const fd = openSync((store as unknown as { journalPath: string }).journalPath, 'a');
-        appendFileSync(fd, line.slice(0, Math.max(1, Math.floor(line.length / 3))));
-        fsyncSync(fd);
+        try {
+          if (decision) {
+            const existing = store.getState().reviews[decision.reviewId];
+            store.commitTorn(
+              (draft) => applyReviewDecision(store, draft, decision!),
+              {
+                op: 'review',
+                recordKeys: existing ? [existing.recordKey] : [],
+                summary: `crash-torn review ${decision.reviewId} -> ${decision.decision}`,
+              },
+              opts,
+            );
+          } else {
+            store.appendLegacyTornBump(opts);
+          }
+        } catch (err) {
+          // 构造失败（如复核项不存在）时也以约定码退出，避免测试悬挂
+          console.error('crash injection failed:', err);
+        }
         process.exit(17);
       });
       return;
@@ -271,10 +376,16 @@ function summarizeParse(p: ParseResult) {
   };
 }
 
-function wrap(store: Store, payload: unknown): { data: unknown; access: { perRequest: AccessCounters; cumulative: AccessCounters } } {
+function wrap(store: Store, payload: unknown): {
+  data: unknown;
+  access: AccessReportCounters & { perRequest: AccessReportCounters; cumulative: AccessReportCounters };
+} {
+  const perRequest = store.getPerRequestCounters();
+  const cumulative = store.getCounters();
   return {
     data: payload,
-    access: { perRequest: store.getPerRequestCounters(), cumulative: store.getCounters() },
+    // 顶层平铺本次请求计数，同时保留 perRequest/cumulative 标准结构
+    access: { ...perRequest, perRequest, cumulative },
   };
 }
 

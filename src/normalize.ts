@@ -13,43 +13,64 @@ interface TimelinePoint {
   kind: 'reading' | 'meter-change';
 }
 
-/** 该记录是否仍有未处理的复核项（直接遍历复核表，不额外读记录） */
-function pendingReasonsOf(reviews: Record<string, ReviewItem>, recordKey: string): string[] {
-  const reasons: string[] = [];
-  for (const item of Object.values(reviews)) {
-    if (item.recordKey === recordKey && item.state === 'pending') reasons.push(item.reason);
-  }
-  return reasons;
-}
-
 function round(n: number): number {
   return Math.round(n * 1e6) / 1e6;
 }
 
 /**
+ * 把任意可解析的时刻边界归一成与存储一致的 'YYYY-MM-DDTHH:mm:ssZ'。
+ * 避免调用方 toISOString() 带 .000Z 毫秒段时，字符串字典序把同一时刻
+ * 误判到边界另一侧；无法解析时原样返回。
+ */
+export function canonicalBoundary(time: string | null | undefined): string | null {
+  if (time === null || time === undefined || time === '') return null;
+  const ms = Date.parse(time);
+  if (Number.isNaN(ms)) return time;
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/**
  * 读取某柜时间线上的活动记录并计算相邻巡检区间。
  * 访问量（可核对）：
- *   - 2 次 indexReads（锚点定位 + 窗口切片，均为二分/定长切片，与柜历史长度无关）
- *   - 窗口内每个时间点恰好 1 次 recordReads——同一记录在整个查询中只读一次，
- *     因此变动一条读数或查询少量巡检时，recordReads 只随窗口大小变化，不随历史长度增长。
+ *   - from 存在时 1 次 indexReads 二分找锚点前一条，再加 1 次 timelineSlice
+ *     二分截窗（共 ≤2 次索引访问）；不再 null-null 切片复制整柜索引。
+ *   - 窗口内每个时间点恰好 1 次 recordReads——同一记录在整个查询中只读一次。
+ *   - 复核项走 recordKey 二级索引并在本次查询内缓存，每条复核项只读一次，
+ *     reviewReads = O(窗口内记录的待核项)，与复核表总条数/柜历史长度无关。
  */
 export function queryIntervals(
   store: Store,
   cabinet: string,
-  fromTime: string | null,
-  toTime: string | null,
+  fromTimeRaw: string | null,
+  toTimeRaw: string | null,
 ): Interval[] {
-  const state = store.getState();
-  // 第一次索引访问：全量时间线索引（轻量项，仅含 time/recordKey），用于二分锚点
-  const fullTimeline = store.timelineSlice(cabinet, null, null);
-  let anchorIdx = 0;
+  const fromTime = canonicalBoundary(fromTimeRaw);
+  const toTime = canonicalBoundary(toTimeRaw);
+  // 第一次索引访问（有 from 时）：二分定位窗口起点，锚点取其前一条
+  let anchorTime: string | null = null;
   if (fromTime) {
-    const lb = lowerBoundTime(fullTimeline, fromTime);
-    anchorIdx = Math.max(0, lb - 1);
+    const loc = store.locateInTimeline(cabinet, fromTime);
+    const arr = store.getState().timeline[cabinet] ?? [];
+    const anchorPos = Math.max(0, loc.index - 1);
+    anchorTime = arr[anchorPos]?.time ?? null;
   }
-  const anchorTime = fullTimeline[anchorIdx]?.time ?? null;
-  // 第二次索引访问：只切出 [锚点时刻, 窗口终点] 的索引项
+  // 第二次索引访问：只切出 [锚点时刻, 窗口终点] 的一小段索引项
   const windowEntries = store.timelineSlice(cabinet, anchorTime, toTime);
+
+  // 同一 recordKey 的复核项在一次查询内只经二级索引读取一次
+  const reviewCache = new Map<string, ReviewItem[]>();
+  const pendingReasonsFor = (recordKey: string): string[] => {
+    let items = reviewCache.get(recordKey);
+    if (!items) {
+      items = store.reviewsForRecord(recordKey);
+      reviewCache.set(recordKey, items);
+    }
+    const reasons: string[] = [];
+    for (const item of items) {
+      if (item.state === 'pending') reasons.push(item.reason);
+    }
+    return reasons;
+  };
 
   // 每个窗口内记录恰好读取一次，缓存到 map 供各区间复用，杜绝重复 recordReads
   const recordMap = new Map<string, StoredRecord>();
@@ -75,25 +96,14 @@ export function queryIntervals(
     const start = readings[i]!;
     const end = readings[i + 1]!;
     const seams = meterChanges.filter((m) => m.time > start.time && m.time <= end.time);
-    intervals.push(buildInterval(state.reviews, recordMap, start, end, seams));
+    intervals.push(buildInterval(recordMap, pendingReasonsFor, start, end, seams));
   }
   return intervals;
 }
 
-function lowerBoundTime(arr: { time: string }[], time: string): number {
-  let lo = 0;
-  let hi = arr.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (arr[mid]!.time < time) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
 function buildInterval(
-  reviews: Record<string, ReviewItem>,
   recordMap: Map<string, StoredRecord>,
+  pendingReasonsFor: (recordKey: string) => string[],
   start: TimelinePoint,
   end: TimelinePoint,
   seamPoints: TimelinePoint[],
@@ -104,8 +114,8 @@ function buildInterval(
   const pendingReasons = new Set<string>();
   const evidence: SourceRef[] = [startRec.source, endRec.source];
 
-  pendingReasonsOf(reviews, start.recordKey).forEach((r) => pendingReasons.add(`起点:${r}`));
-  pendingReasonsOf(reviews, end.recordKey).forEach((r) => pendingReasons.add(`终点:${r}`));
+  pendingReasonsFor(start.recordKey).forEach((r) => pendingReasons.add(`起点:${r}`));
+  pendingReasonsFor(end.recordKey).forEach((r) => pendingReasons.add(`终点:${r}`));
 
   // 区间内换表事件（按时间先后），全部来自已缓存的记录，无额外 recordReads
   const meterChanges: Interval['meterChanges'] = [];
@@ -115,7 +125,7 @@ function buildInterval(
     const env = recordMap.get(p.recordKey);
     if (!env || !env.active) continue;
     const m = env.record;
-    const reasons = pendingReasonsOf(reviews, m.key);
+    const reasons = pendingReasonsFor(m.key);
     reasons.forEach((r) => pendingReasons.add(`换表:${r}`));
     evidence.push(m.source);
     meterChanges.push({
@@ -157,7 +167,7 @@ function buildInterval(
   let status: Interval['status'] = 'ok';
   if (isAnomaly) {
     // 仅当下降问题仍在复核队列时才同时待核
-    if (pendingReasonsOf(reviews, end.recordKey).includes('negative-delta')) status = 'pending-review';
+    if (pendingReasonsFor(end.recordKey).includes('negative-delta')) status = 'pending-review';
     else status = 'anomaly';
   } else if (pendingReasons.size > 0 || seamPending) {
     status = 'pending-review';

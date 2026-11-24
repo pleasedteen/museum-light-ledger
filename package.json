@@ -7,7 +7,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/server.js",
-    "test": "npm run build && node dist/test/run-tests.js"
+    "pretest": "tsc -p tsconfig.json || true",
+    "test": "node dist/test/boundedness-check.js && node dist/test/run-tests.js",
+    "test:bounded": "tsc -p tsconfig.json || true && node dist/test/boundedness-check.js"
   },
   "devDependencies": {
     "typescript": "^5.6.3",

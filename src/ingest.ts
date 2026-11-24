@@ -7,9 +7,11 @@ import type {
   ReviewItem,
   SourceRef,
   State,
+  StoredRecord,
+  TimelineEntry,
 } from './types.js';
 import { hashString } from './parse-utils.js';
-import { recordKeyOf, Store } from './store.js';
+import { getActiveTxnStore, recordKeyOf, Store } from './store.js';
 
 export interface IngestRequest {
   materialId: string;
@@ -85,6 +87,7 @@ const ISSUE_REASON: Record<string, string> = {
 };
 
 function ensureReviewItem(
+  store: Store,
   state: State,
   record: CandidateRecord,
   reasonCode: string,
@@ -98,6 +101,7 @@ function ensureReviewItem(
       existing.state = 'pending';
       existing.updatedAt = Date.now();
       existing.detail = detail;
+      store.draftWriteReview(state, existing);
     }
     return null;
   }
@@ -113,7 +117,7 @@ function ensureReviewItem(
     updatedAt: Date.now(),
     evidence: [record.source],
   };
-  state.reviews[id] = item;
+  store.draftWriteReview(state, item);
   return id;
 }
 
@@ -124,7 +128,7 @@ function deriveIssuesForRecord(store: Store, draft: State, record: CandidateReco
 
   const raise = (code: string, detail?: string) => {
     activeReasons.add(code);
-    const id = ensureReviewItem(draft, record, code, detail ?? ISSUE_REASON[code] ?? code);
+    const id = ensureReviewItem(store, draft, record, code, detail ?? ISSUE_REASON[code] ?? code);
     if (id) created.push(id);
   };
 
@@ -183,6 +187,7 @@ function deriveIssuesForRecord(store: Store, draft: State, record: CandidateReco
       item.state = 'confirmed';
       item.detail = `${item.detail}（问题在后续版本中消失，自动确认）`;
       item.updatedAt = Date.now();
+      store.draftWriteReview(draft, item);
     }
   }
   return created;
@@ -293,6 +298,8 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
 
   draft.materials[req.materialId] ??= [];
   draft.materials[req.materialId]!.push(info);
+  // 收集该材料最终版本数组到增量日志（旧版本状态变更也在同一数组内）
+  store.draftTouchMaterial(draft, req.materialId);
 
   return {
     materialId: req.materialId,
@@ -312,9 +319,73 @@ export interface ReviewDecision {
   correction?: ReviewItem['correction'];
 }
 
-/** 人工复核结论：与规范表在同一事务内生效 */
-export function applyReviewDecision(state: State, d: ReviewDecision): ReviewItem {
-  const item = state.reviews[d.reviewId];
+/**
+ * 复核结论落库所需的最小宿主接口，由 Store 的 draft* 方法实现。
+ * 这样既支持新的三参写法（HTTP/事务内带计数与增量日志），
+ * 也兼容旧版两参 applyReviewDecision(state, d) 的直接调用。
+ */
+export interface DecisionHost {
+  draftReadReview(draft: State, id: string): ReviewItem | null;
+  draftWriteReview(draft: State, item: ReviewItem): void;
+  draftReadRecord(draft: State, key: string): StoredRecord | null;
+  draftWriteRecord(draft: State, key: string, envelope: StoredRecord): void;
+  draftRemoveTimeline(draft: State, cabinet: string, time: string, recordKey: string): void;
+  draftUpsertTimeline(draft: State, entry: TimelineEntry): void;
+}
+
+/** 无 Store 事务时的纯内存宿主：直接改 state，不记账、不收集增量 */
+const plainDecisionHost: DecisionHost = {
+  draftReadReview: (s, id) => s.reviews[id] ?? null,
+  draftWriteReview: (s, item) => {
+    s.reviews[item.id] = item;
+  },
+  draftReadRecord: (s, key) => s.records[key] ?? null,
+  draftWriteRecord: (s, key, envelope) => {
+    s.records[key] = envelope;
+  },
+  draftRemoveTimeline: (s, cabinet, time, recordKey) => {
+    const arr = s.timeline[cabinet];
+    if (!arr) return;
+    const pos = arr.findIndex((e) => e.time === time && e.recordKey === recordKey);
+    if (pos >= 0) arr.splice(pos, 1);
+  },
+  draftUpsertTimeline: (s, entry) => {
+    const arr = (s.timeline[entry.cabinet] ??= []);
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (arr[mid]!.time < entry.time) lo = mid + 1;
+      else hi = mid;
+    }
+    const remove = arr[lo] && arr[lo]!.time === entry.time ? 1 : 0;
+    arr.splice(lo, remove, entry);
+  },
+};
+
+export function applyReviewDecision(store: Store, state: State, d: ReviewDecision): ReviewItem;
+/** @deprecated 兼容旧签名；若运行在 Store.commit 回调内，仍会自动记账并写增量 */
+export function applyReviewDecision(state: State, d: ReviewDecision): ReviewItem;
+export function applyReviewDecision(a: Store | State, b: State | ReviewDecision, c?: ReviewDecision): ReviewItem {
+  let host: DecisionHost;
+  let state: State;
+  let decision: ReviewDecision;
+  if (c) {
+    host = a as Store;
+    state = b as State;
+    decision = c;
+  } else {
+    state = a as State;
+    decision = b as ReviewDecision;
+    // 在我们的 commit 回调内被旧式调用时，仍接入当前事务的记账/增量收集
+    host = getActiveTxnStore() ?? plainDecisionHost;
+  }
+  return decideReview(host, state, decision);
+}
+
+/** 人工复核结论：与规范表在同一事务（同一条原子日志）内生效 */
+function decideReview(host: DecisionHost, state: State, d: ReviewDecision): ReviewItem {
+  const item = host.draftReadReview(state, d.reviewId);
   if (!item) throw new Error(`review item not found: ${d.reviewId}`);
   item.state = d.decision;
   item.decidedBy = d.decidedBy;
@@ -322,7 +393,7 @@ export function applyReviewDecision(state: State, d: ReviewDecision): ReviewItem
 
   if (d.decision === 'corrected' && d.correction) {
     item.correction = d.correction;
-    const env = state.records[item.recordKey];
+    const env = host.draftReadRecord(state, item.recordKey);
     if (env) {
       const r = env.record;
       const oldCab = r.cabinet || 'UNASSIGNED';
@@ -332,48 +403,37 @@ export function applyReviewDecision(state: State, d: ReviewDecision): ReviewItem
       if (d.correction.value !== undefined) r.value = d.correction.value;
       if (d.correction.oldFinal !== undefined) r.oldFinal = d.correction.oldFinal;
       if (d.correction.newStart !== undefined) r.newStart = d.correction.newStart;
-      r.issues = r.issues.filter((x) => x === item.reason || x === 'cross-page-merge' ? false : true);
+      r.issues = r.issues.filter((x) => (x === item.reason || x === 'cross-page-merge' ? false : true));
       r.updatedAt = Date.now();
-      // 索引随订正一起移动
+      // 记录信封整体作为增量 put 落盘（只此一条，不重写整份台账）
+      host.draftWriteRecord(state, r.key, env);
+      // 索引随订正一起定点移动：旧柜二分删除 + 新柜二分插入，都是常数次访问
       const newCab = r.cabinet || 'UNASSIGNED';
       const newTime = r.time || 'UNKNOWN-TIME';
       if (newCab !== oldCab || newTime !== oldTime) {
-        const arr = state.timeline[oldCab];
-        if (arr) {
-          const pos = arr.findIndex((e) => e.recordKey === r.key);
-          if (pos >= 0) arr.splice(pos, 1);
-        }
-        state.timeline[newCab] ??= [];
-        const target = { cabinet: newCab, time: newTime, recordKey: r.key };
-        const tArr = state.timeline[newCab]!;
-        const lb = lowerBound(tArr, newTime);
-        tArr.splice(lb, 0, target);
+        host.draftRemoveTimeline(state, oldCab, oldTime, r.key);
       }
+      host.draftUpsertTimeline(state, { cabinet: newCab, time: newTime, recordKey: r.key });
     }
   }
 
   if (d.decision === 'rejected') {
-    const env = state.records[item.recordKey];
+    const env = host.draftReadRecord(state, item.recordKey);
     if (env) {
       env.active = false;
+      host.draftWriteRecord(state, item.recordKey, env);
       // 拒绝的记录退出规范表时间线，但保留审计痕迹
-      const arr = state.timeline[env.record.cabinet || 'UNASSIGNED'];
-      if (arr) {
-        const pos = arr.findIndex((e) => e.recordKey === env.record.key);
-        if (pos >= 0) arr.splice(pos, 1);
-      }
+      const r = env.record;
+      host.draftRemoveTimeline(
+        state,
+        r.cabinet || 'UNASSIGNED',
+        r.time || 'UNKNOWN-TIME',
+        item.recordKey,
+      );
     }
   }
-  return item;
-}
 
-function lowerBound(arr: { time: string }[], time: string): number {
-  let lo = 0;
-  let hi = arr.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (arr[mid]!.time < time) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
+  // 复核项只写一次：结论、订正内容与上面的记录/索引改动在同一条原子日志内
+  host.draftWriteReview(state, item);
+  return item;
 }

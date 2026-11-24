@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>B 馆光照抄表 - 多柜并排（跨页拆行）</title></head>
+<body>
+<h2>B 馆展厅光照累计读数（多柜并排）</h2>
+<table border="1">
+  <tr><th>巡检时刻</th><th>B-101</th><th>B-102</th><th>B-103</th><th>备注</th></tr>
+  <tr><td>2026-11-10 08:30</td><td>500</td><td>700</td><td>900</td><td>开馆</td></tr>
+  <tr><td>2026-11-11 08:30</td><td>1100</td><td>1400</td><td>1850</td><td></td></tr>
+</table>
+<!-- 翻页：下一页重复表头，且 11-12 这条巡检的柜号列与读数拆到两页 -->
+<p>第 2 页 / 共 2 页</p>
+<table border="1">
+  <tr><th>巡检时刻</th><th>B-101</th><th>B-102</th><th>B-103</th><th>备注</th></tr>
+  <tr><td>2026-11-12 08:30</td><td>1700</td><td>2100</td><td></td><td>B-103 读数见下页续行</td></tr>
+</table>
+<!-- 同一条巡检 2026-11-12 的剩余柜列拆到本页：无时刻的续行 -->
+<table border="1">
+  <tr><th>续行</th><th>B-103</th></tr>
+  <tr><td>（承上页 2026-11-12 08:30）</td><td>2300</td></tr>
+</table>
+<table border="1">
+  <tr><th>巡检时刻</th><th>B-101</th><th>B-102</th><th>B-103</th><th>备注</th></tr>
+  <tr><td>2026-11-13 08:30</td><td>2350</td><td>2750</td><td>3600</td><td></td></tr>
+</table>
+</body>
+</html>

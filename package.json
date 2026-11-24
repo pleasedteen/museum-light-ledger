@@ -1,0 +1,16 @@
+{
+  "name": "museum-light-ledger",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "博物馆累计光照抄表单批量导入、跨页合并、复核与规范表本地 HTTP 服务",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "test": "npm run build && node dist/test/run-tests.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^22.10.2"
+  }
+}

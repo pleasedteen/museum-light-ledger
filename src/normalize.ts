@@ -1,0 +1,192 @@
+import type {
+  CandidateRecord,
+  Interval,
+  ReviewItem,
+  SourceRef,
+  StoredRecord,
+} from './types.js';
+import { intervalId, Store } from './store.js';
+
+interface TimelinePoint {
+  time: string;
+  recordKey: string;
+  kind: 'reading' | 'meter-change';
+}
+
+/** 该记录是否仍有未处理的复核项（直接遍历复核表，不额外读记录） */
+function pendingReasonsOf(reviews: Record<string, ReviewItem>, recordKey: string): string[] {
+  const reasons: string[] = [];
+  for (const item of Object.values(reviews)) {
+    if (item.recordKey === recordKey && item.state === 'pending') reasons.push(item.reason);
+  }
+  return reasons;
+}
+
+function round(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
+}
+
+/**
+ * 读取某柜时间线上的活动记录并计算相邻巡检区间。
+ * 访问量（可核对）：
+ *   - 2 次 indexReads（锚点定位 + 窗口切片，均为二分/定长切片，与柜历史长度无关）
+ *   - 窗口内每个时间点恰好 1 次 recordReads——同一记录在整个查询中只读一次，
+ *     因此变动一条读数或查询少量巡检时，recordReads 只随窗口大小变化，不随历史长度增长。
+ */
+export function queryIntervals(
+  store: Store,
+  cabinet: string,
+  fromTime: string | null,
+  toTime: string | null,
+): Interval[] {
+  const state = store.getState();
+  // 第一次索引访问：全量时间线索引（轻量项，仅含 time/recordKey），用于二分锚点
+  const fullTimeline = store.timelineSlice(cabinet, null, null);
+  let anchorIdx = 0;
+  if (fromTime) {
+    const lb = lowerBoundTime(fullTimeline, fromTime);
+    anchorIdx = Math.max(0, lb - 1);
+  }
+  const anchorTime = fullTimeline[anchorIdx]?.time ?? null;
+  // 第二次索引访问：只切出 [锚点时刻, 窗口终点] 的索引项
+  const windowEntries = store.timelineSlice(cabinet, anchorTime, toTime);
+
+  // 每个窗口内记录恰好读取一次，缓存到 map 供各区间复用，杜绝重复 recordReads
+  const recordMap = new Map<string, StoredRecord>();
+  const readings: TimelinePoint[] = [];
+  const meterChanges: TimelinePoint[] = [];
+
+  for (const e of windowEntries) {
+    const env: StoredRecord | null = store.readRecord(e.recordKey);
+    if (!env || !env.active) continue;
+    if (env.record.cabinet !== cabinet) continue;
+    recordMap.set(e.recordKey, env);
+    (env.record.kind === 'meter-change' ? meterChanges : readings).push({
+      time: e.time,
+      recordKey: e.recordKey,
+      kind: env.record.kind,
+    });
+  }
+
+  if (readings.length < 2) return [];
+
+  const intervals: Interval[] = [];
+  for (let i = 0; i < readings.length - 1; i++) {
+    const start = readings[i]!;
+    const end = readings[i + 1]!;
+    const seams = meterChanges.filter((m) => m.time > start.time && m.time <= end.time);
+    intervals.push(buildInterval(state.reviews, recordMap, start, end, seams));
+  }
+  return intervals;
+}
+
+function lowerBoundTime(arr: { time: string }[], time: string): number {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid]!.time < time) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function buildInterval(
+  reviews: Record<string, ReviewItem>,
+  recordMap: Map<string, StoredRecord>,
+  start: TimelinePoint,
+  end: TimelinePoint,
+  seamPoints: TimelinePoint[],
+): Interval {
+  const startRec: CandidateRecord = recordMap.get(start.recordKey)!.record;
+  const endRec: CandidateRecord = recordMap.get(end.recordKey)!.record;
+
+  const pendingReasons = new Set<string>();
+  const evidence: SourceRef[] = [startRec.source, endRec.source];
+
+  pendingReasonsOf(reviews, start.recordKey).forEach((r) => pendingReasons.add(`起点:${r}`));
+  pendingReasonsOf(reviews, end.recordKey).forEach((r) => pendingReasons.add(`终点:${r}`));
+
+  // 区间内换表事件（按时间先后），全部来自已缓存的记录，无额外 recordReads
+  const meterChanges: Interval['meterChanges'] = [];
+  let seamPending = false;
+
+  for (const p of seamPoints) {
+    const env = recordMap.get(p.recordKey);
+    if (!env || !env.active) continue;
+    const m = env.record;
+    const reasons = pendingReasonsOf(reviews, m.key);
+    reasons.forEach((r) => pendingReasons.add(`换表:${r}`));
+    evidence.push(m.source);
+    meterChanges.push({
+      time: m.time,
+      oldFinal: m.oldFinal,
+      newStart: m.newStart,
+      recordKey: m.key,
+    });
+    if (m.oldFinal === null || m.newStart === null || reasons.length > 0) seamPending = true;
+  }
+
+  // 计算增量：逐段拼接（当前表段 -> 旧表终值，换表后从新表起值重新累计）
+  let cursorValue = startRec.value;
+  let uncomputable = startRec.value === null || endRec.value === null;
+  let delta = 0;
+
+  for (const mc of meterChanges) {
+    const m: CandidateRecord = recordMap.get(mc.recordKey)!.record;
+    if (cursorValue === null || m.oldFinal === null || m.newStart === null) {
+      uncomputable = true;
+      break;
+    }
+    delta += round(m.oldFinal - cursorValue);
+    cursorValue = m.newStart;
+  }
+
+  let finalDelta: number | null;
+  if (!uncomputable && cursorValue !== null && endRec.value !== null) {
+    delta += round(endRec.value - cursorValue);
+    finalDelta = delta;
+  } else {
+    finalDelta = null;
+  }
+
+  // 无换表却出现读数下降 -> 异常（人工确认后仍保留 anomaly，只是不再待核）
+  const isAnomaly = finalDelta !== null && meterChanges.length === 0 && finalDelta < 0;
+  if (isAnomaly) pendingReasons.add('negative-delta');
+
+  let status: Interval['status'] = 'ok';
+  if (isAnomaly) {
+    // 仅当下降问题仍在复核队列时才同时待核
+    if (pendingReasonsOf(reviews, end.recordKey).includes('negative-delta')) status = 'pending-review';
+    else status = 'anomaly';
+  } else if (pendingReasons.size > 0 || seamPending) {
+    status = 'pending-review';
+  }
+
+  return {
+    intervalId: intervalId(startRec.cabinet, startRec.time, endRec.time),
+    cabinet: startRec.cabinet,
+    fromTime: startRec.time,
+    toTime: endRec.time,
+    fromRecordKey: start.recordKey,
+    toRecordKey: end.recordKey,
+    delta: finalDelta,
+    status,
+    pendingReasons: Array.from(pendingReasons),
+    meterChanges,
+    evidence: dedupeEvidence(evidence),
+  };
+}
+
+function dedupeEvidence(list: SourceRef[]): SourceRef[] {
+  const seen = new Set<string>();
+  const out: SourceRef[] = [];
+  for (const e of list) {
+    const k = `${e.materialId}|${e.version}|${e.lines.join(',')}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(e);
+    }
+  }
+  return out;
+}

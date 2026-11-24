@@ -2,8 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { type AddressInfo } from 'node:net';
 import { appendFileSync, fsyncSync, openSync } from 'node:fs';
 import { join } from 'node:path';
-import { parseHtml } from './parse-html.js';
-import { parseText } from './parse-text.js';
+import { parseMediaType, runParse } from './parse-dispatch.js';
 import { Store } from './store.js';
 import {
   applyMaterial,
@@ -12,9 +11,17 @@ import {
   type IngestRequest,
   type ReviewDecision,
 } from './ingest.js';
+import {
+  BatchConflictError,
+  BatchValidationError,
+  batchContentHash,
+  lookupBatch,
+  prepareBatch,
+  publishBatch,
+  type BatchRequest,
+} from './batch.js';
 import { queryIntervals } from './normalize.js';
 import type { AccessCounters, Interval, ParseResult } from './types.js';
-import { hashString } from './parse-utils.js';
 
 export interface AppContext {
   store: Store;
@@ -49,17 +56,6 @@ function readBody(req: IncomingMessage, limitBytes = 20 * 1024 * 1024): Promise<
   });
 }
 
-function parseMediaType(fileName: string, explicit?: string): 'html' | 'text' {
-  if (explicit === 'text/html' || explicit === 'html') return 'html';
-  if (explicit === 'text/plain' || explicit === 'text') return 'text';
-  return /\.x?html?$/i.test(fileName) ? 'html' : 'text';
-}
-
-function runParse(req: IngestRequest): ParseResult {
-  const kind = parseMediaType(req.fileName, req.mediaType);
-  const materialKey = `${req.materialId}#${hashString(req.content)}`;
-  return kind === 'html' ? parseHtml(req.content, materialKey) : parseText(req.content, materialKey);
-}
 
 export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const { store } = ctx;
@@ -120,6 +116,87 @@ export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: 
           parse: summarizeParse(parsed),
         }),
       );
+    }
+
+    // ---------- 批量送达（按批原子发布） ----------
+    if (method === 'POST' && (path === '/materials/batch' || path === '/api/materials/batch')) {
+      const raw = JSON.parse(await readBody(req)) as BatchRequest;
+      if (!raw || typeof raw !== 'object' || !raw.batchId || !Array.isArray(raw.items)) {
+        return send(res, 400, { error: 'batchId 与 items 为必填' });
+      }
+      const contentHash = batchContentHash(raw);
+      const existing = lookupBatch(store.getState(), raw.batchId);
+      if (existing) {
+        // 原批重送：原样返回首次逐份回执；同批号换内容则冲突
+        if (existing.contentHash !== contentHash) {
+          return send(res, 409, {
+            error: 'batch conflict',
+            batchId: raw.batchId,
+            detail: '同一批号已用于不同内容',
+            access: { perRequest: store.getPerRequestCounters(), cumulative: store.getCounters() },
+          });
+        }
+        return send(
+          res,
+          200,
+          wrap(store, {
+            batchId: raw.batchId,
+            idempotentHit: true,
+            operationSeq: existing.operationSeq,
+            receipt: existing,
+          }),
+        );
+      }
+
+      let prepared;
+      try {
+        prepared = await prepareBatch(store.getState(), raw);
+      } catch (err) {
+        if (err instanceof BatchValidationError) {
+          return send(res, err.status, {
+            error: 'batch rejected',
+            batchId: raw.batchId,
+            published: false,
+            failures: err.failures,
+            access: { perRequest: store.getPerRequestCounters(), cumulative: store.getCounters() },
+          });
+        }
+        throw err;
+      }
+
+      try {
+        const published = publishBatch(store, raw, prepared);
+        return send(
+          res,
+          200,
+          wrap(store, {
+            batchId: raw.batchId,
+            idempotentHit: published.idempotentHit,
+            operationSeq: published.operationSeq,
+            receipt: published.receipt,
+          }),
+        );
+      } catch (err) {
+        if (err instanceof BatchConflictError) {
+          return send(res, 409, {
+            error: 'batch conflict',
+            batchId: raw.batchId,
+            detail: '同一批号已用于不同内容',
+            access: { perRequest: store.getPerRequestCounters(), cumulative: store.getCounters() },
+          });
+        }
+        if (err instanceof BatchValidationError) {
+          return send(res, err.status, {
+            error: 'batch rejected',
+            batchId: raw.batchId,
+            published: false,
+            failures: err.failures,
+            detail: err.message,
+            access: { perRequest: store.getPerRequestCounters(), cumulative: store.getCounters() },
+          });
+        }
+        throw err;
+      }
     }
 
     // ---------- 仅解析（预览，不落库） ----------

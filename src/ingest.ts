@@ -14,7 +14,7 @@ import { recordKeyOf, Store } from './store.js';
 export interface IngestRequest {
   materialId: string;
   fileName: string;
-  mediaType: string;
+  mediaType?: string;
   content: string;
   op?: MaterialOp;
   clientToken?: string;
@@ -89,11 +89,13 @@ function ensureReviewItem(
   record: CandidateRecord,
   reasonCode: string,
   detail: string,
+  opts: { reopen?: boolean } = {},
 ): string | null {
   const id = `${record.key}#${reasonCode}`;
   const existing = state.reviews[id];
   if (existing) {
-    if (existing.state !== 'pending') {
+    // reopen=false 用于批次发布后的“重算”：已确认/已订正的人工结论不因重算被推翻
+    if (existing.state !== 'pending' && opts.reopen !== false) {
       // 问题在更正后再次出现：重新入队
       existing.state = 'pending';
       existing.updatedAt = Date.now();
@@ -118,18 +120,43 @@ function ensureReviewItem(
 }
 
 /** 对一条记录做问题派生；问题消失时自动关闭对应的待核项 */
-function deriveIssuesForRecord(store: Store, draft: State, record: CandidateRecord): string[] {
+export function deriveIssuesForRecord(
+  store: Store,
+  draft: State,
+  record: CandidateRecord,
+  opts: { reopen?: boolean } = {},
+): string[] {
   const created: string[] = [];
   const activeReasons = new Set<string>();
 
   const raise = (code: string, detail?: string) => {
     activeReasons.add(code);
-    const id = ensureReviewItem(draft, record, code, detail ?? ISSUE_REASON[code] ?? code);
+    const id = ensureReviewItem(draft, record, code, detail ?? ISSUE_REASON[code] ?? code, opts);
     if (id) created.push(id);
   };
 
   for (const issue of record.issues) raise(issue);
   if (record.confidence === 'low' && record.issues.length === 0) raise('low-confidence');
+
+  // 跨材料重复：同柜/同刻/同类型存在另一份材料的活动记录（动态判定，
+  // 使得任一方被撤回/更正后，另一方的重复待核项能对称地关闭）。
+  // 注意：时间线每 (柜,时刻) 仅保留一个索引项，同刻多材料会相互覆盖，
+  // 因此这里直接扫记录表，避免遗漏。
+  if (record.kind === 'reading' && record.cabinet && record.time) {
+    for (const env of Object.values(draft.records)) {
+      if (!env.active || env.record.key === record.key) continue;
+      const other = env.record;
+      if (
+        other.kind === record.kind &&
+        other.cabinet === record.cabinet &&
+        other.time === record.time &&
+        other.materialId !== record.materialId
+      ) {
+        raise('duplicate-delivery', `与材料 ${other.materialId} 在同柜同刻重复`);
+        break;
+      }
+    }
+  }
 
   // 读数下降检查：同柜时间线中前一条活动读数若更大，且两者间无换表，则入复核
   if (record.kind === 'reading' && record.cabinet && record.time && record.value !== null) {
@@ -189,7 +216,13 @@ function deriveIssuesForRecord(store: Store, draft: State, record: CandidateReco
 }
 
 /** 应用一次材料操作（ingest/correct/withdraw），在 store.commit 的 draft 事务内执行 */
-export function applyMaterial(store: Store, draft: State, req: IngestRequest, parsed: ParseResult): IngestOutcome {
+export function applyMaterial(
+  store: Store,
+  draft: State,
+  req: IngestRequest,
+  parsed: ParseResult,
+  opts: { derive?: boolean } = {},
+): IngestOutcome {
   const idem = findIdempotent(draft, req);
   if (idem) {
     return {
@@ -211,7 +244,7 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
     materialId: req.materialId,
     version,
     fileName: req.fileName,
-    mediaType: req.mediaType,
+    mediaType: req.mediaType ?? '',
     op,
     status: 'active',
     supersededBy: null,
@@ -261,18 +294,6 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
 
     for (const cand of parsed.candidates) {
       const rec = buildRecord(info, cand);
-      // 重复送达检测：同柜/同时刻/同类型、不同材料
-      if (op === 'ingest') {
-        const dup = Object.values(draft.records).find(
-          (env) =>
-            env.active &&
-            env.record.materialId !== req.materialId &&
-            env.record.kind === rec.kind &&
-            env.record.cabinet === rec.cabinet &&
-            env.record.time === rec.time,
-        );
-        if (dup) rec.issues.push('duplicate-delivery');
-      }
       draft.records[rec.key] = { record: rec, active: true };
       store.draftWriteRecord(draft, rec.key, draft.records[rec.key]!);
       store.draftUpsertTimeline(draft, {
@@ -284,10 +305,12 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
       info.recordKeys.push(rec.key);
     }
 
-    // 派生复核项（含换表接续、跨材料重复等）
-    for (const key of recordKeys) {
-      const rec = draft.records[key]!.record;
-      newReviewIds.push(...deriveIssuesForRecord(store, draft, rec));
+    // 派生复核项（含换表接续、跨材料重复等）；批量发布时由批次统一重算，跳过逐份派生
+    if (opts.derive !== false) {
+      for (const key of recordKeys) {
+        const rec = draft.records[key]!.record;
+        newReviewIds.push(...deriveIssuesForRecord(store, draft, rec));
+      }
     }
   }
 

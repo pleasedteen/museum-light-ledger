@@ -30,6 +30,7 @@ export function emptyState(): State {
     records: {},
     reviews: {},
     timeline: {},
+    batches: {},
     operations: [],
     counters: emptyCounters(),
   };
@@ -85,21 +86,36 @@ export class Store {
     }
     this.journalEntries = 0;
     if (existsSync(this.journalPath)) {
-      const lines = readFileSync(this.journalPath, 'utf8').split('\n').filter((l) => l.trim() !== '');
+      const raw = readFileSync(this.journalPath, 'utf8');
+      const lines = raw.split('\n');
+      const completeLines: string[] = [];
+      let truncated = false;
       for (const line of lines) {
+        if (line.trim() === '') continue;
         let entry: JournalEntry;
         try {
           entry = JSON.parse(line) as JournalEntry;
         } catch {
           // 日志尾部半条（写入中断）：停止重放，前面已 fsync 的完整条目保留
+          truncated = true;
           break;
         }
+        completeLines.push(line);
         if (entry.type === 'operation' && entry.seq > state.seq) {
           state = entry.state;
           this.journalEntries += 1;
         }
       }
+      // 关键：把残缺尾部截掉。否则重启后继续追加，残缺行不再位于末尾，
+      // 下次重启会在同一处停止，导致其后已 fsync 的操作全部丢失。
+      if (truncated) {
+        const tmpJournal = join(this.dir, `journal.recover-${process.pid}`);
+        writeFileSync(tmpJournal, completeLines.join('\n') + (completeLines.length ? '\n' : ''));
+        renameSync(tmpJournal, this.journalPath);
+      }
     }
+    // 兼容早于批量送达的日志/快照（当时没有 batches 字段）
+    state.batches ??= {};
     return state;
   }
 

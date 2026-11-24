@@ -241,7 +241,13 @@ async function main(): Promise<void> {
   check('重启后序号停在整次操作之前（未提交操作不可见）', health.seq === seqOk, `seq=${health.seq}, expected=${seqOk}`);
   const a01Reboot = await fetch(base2 + '/intervals?cabinet=A-01').then((r) => r.json());
   check('已成功提交的数据完整保留', a01Reboot.data.intervals.length >= 3);
-  restarted.server.close();
+  // 残留半条日志已在加载时截断：重启后继续追加，再次重启不会吞掉其后操作
+  const journalAfterRecovery = readFileSync(join(DATA, 'journal.log'), 'utf8');
+  check('崩溃后重启会截断日志残缺尾部', !journalAfterRecovery.trim().split('\n').some((l) => {
+    try { JSON.parse(l); return false; } catch { return true; }
+  }));
+
+  await batchTests(base2, restarted);
 
   console.log(`\n结果：${passed} 通过 / ${failed} 失败，用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (failed > 0) {
@@ -252,8 +258,194 @@ async function main(): Promise<void> {
   }
 }
 
-async function waitForPort(port: number, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+async function batchTests(base2: string, restarted: { server: Server; store: any }): Promise<void> {
+  const apiAt = async (method: string, path: string, body?: unknown): Promise<any> => {
+    const res = await fetch(base2 + path, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    let json: any;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = { raw: text };
+    }
+    return { status: res.status, ok: res.ok, json };
+  };
+  const fixture = (f: string) => readFileSync(join(FIXTURES, f), 'utf8');
+  const item = (materialId: string, fileName: string, op: 'ingest' = 'ingest') => ({
+    materialId,
+    fileName,
+    mediaType: fileName.endsWith('.html') ? 'text/html' : 'text/plain',
+    content: fixture(fileName),
+    op,
+  });
+
+  console.log('== 8. 按批送达：整批原子发布与逐份回执 ==');
+  const seqBefore = (await apiAt('GET', '/health')).json.seq;
+  const b1 = await apiAt('POST', '/materials/batch', {
+    batchId: 'B-first',
+    items: [item('bat-e', 'e-batch-vertical.txt'), item('bat-f', 'f-batch-vertical.txt')],
+  });
+  check('整批发布成功（200）', b1.status === 200, `status=${b1.status}`);
+  check('逐份回执数量正确', b1.json.data.receipt.items.length === 2);
+  check(
+    '逐份回执含版本/记录键/版式',
+    b1.json.data.receipt.items.every(
+      (it: any) => it.version >= 1 && it.recordKeys.length > 0 && it.layout === 'vertical',
+    ),
+  );
+  check('整批只产生一条操作日志（序号 +1）', b1.json.data.operationSeq === seqBefore + 1, `seq=${b1.json.data.operationSeq}, before=${seqBefore}`);
+  const x01 = await apiAt('GET', '/intervals?cabinet=X-01');
+  const x02 = await apiAt('GET', '/intervals?cabinet=X-02');
+  check('批内材料区间按整批生效结果计算 X-01', x01.json.data.intervals.map((i: Interval) => i.delta).join(',') === '400,400', x01.json.data.intervals.map((i: Interval) => i.delta).join(','));
+  check('批内材料区间按整批生效结果计算 X-02', x02.json.data.intervals.map((i: Interval) => i.delta).join(',') === '400,400', x02.json.data.intervals.map((i: Interval) => i.delta).join(','));
+
+  console.log('== 9. 任一份失败则整批不生效（412/回滚） ==');
+  const seqBeforeFail = (await apiAt('GET', '/health')).json.seq;
+  const bad = await apiAt('POST', '/materials/batch', {
+    batchId: 'B-bad',
+    items: [item('bat-j', 'j-batch-valid2.txt'), item('bat-invalid', 'g-batch-invalid.txt')],
+  });
+  check('含不可解析材料时整批被拒（422）', bad.status === 422, `status=${bad.status}`);
+  check('拒绝回执逐份给出失败原因', Array.isArray(bad.json.failures) && bad.json.failures.some((f: any) => f.errorCode === 'empty-material'));
+  check('整批未生效（序号不变）', (await apiAt('GET', '/health')).json.seq === seqBeforeFail);
+  const x05 = await apiAt('GET', '/records?cabinet=X-05');
+  check('批内合法材料也未被发布（X-05 无记录）', x05.json.data.count === 0, `count=${x05.json.data.count}`);
+  const batJ = await apiAt('GET', '/materials?materialId=bat-j');
+  check('批内合法材料不产生版本台账', (batJ.json.data.versions ?? []).length === 0);
+  const batchBad = await apiAt('GET', '/materials?materialId=B-bad');
+  check('被拒批次不落批号回执（同批号可用于校验后重送）', (batchBad.json.data.versions ?? []).length === 0);
+
+  console.log('== 9b. 发布时引用失效：整批回滚 ==');
+  // 先放一份批外材料 X-07，其 correct 将作为批内成员；校验期间把它批外撤回
+  await apiAt('POST', '/materials', {
+    materialId: 'mat-race',
+    fileName: 'j-batch-valid2.txt',
+    mediaType: 'text/plain',
+    content: fixture('j-batch-valid2.txt'),
+  });
+  const seqBeforeRace = (await apiAt('GET', '/health')).json.seq;
+  const raceBatch = apiAt('POST', '/materials/batch', {
+    batchId: 'B-race',
+    testPauseMs: 250,
+    items: [
+      {
+        materialId: 'mat-race',
+        fileName: 'i-batch-dupe.txt',
+        mediaType: 'text/plain',
+        content: fixture('i-batch-dupe.txt'),
+        op: 'correct',
+      },
+      item('bat-race-ok', 'e-batch-vertical.txt'),
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  // 校验期间批外撤回 mat-race —— 批内 correct 的引用在发布时已失效
+  await apiAt('POST', '/materials', {
+    materialId: 'mat-race',
+    fileName: 'j-batch-valid2.txt',
+    mediaType: 'text/plain',
+    content: fixture('j-batch-valid2.txt'),
+    op: 'withdraw',
+  });
+  const raceResult = await raceBatch;
+  check('发布时引用失效则整批 422 拒绝', raceResult.status === 422, `status=${raceResult.status}`);
+  check('拒绝原因指向 unknown-material', raceResult.json.failures.some((f: any) => f.errorCode === 'unknown-material'));
+  check('整批回滚（批内另一份也未被发布）', (await apiAt('GET', '/materials?materialId=bat-race-ok')).json.data.versions.length === 0);
+  check('撤回本身已生效，序号只 +1（批次未提交）', (await apiAt('GET', '/health')).json.seq === seqBeforeRace + 1, `seq=${(await apiAt('GET', '/health')).json.seq}`);
+
+  console.log('== 10. 重启后原批重送：拿到首次逐份回执 ==');
+  const firstReceipt = b1.json.data.receipt;
+  const seqBeforeResend = (await apiAt('GET', '/health')).json.seq;
+  const resend = await apiAt('POST', '/materials/batch', {
+    batchId: 'B-first',
+    items: [item('bat-e', 'e-batch-vertical.txt'), item('bat-f', 'f-batch-vertical.txt')],
+  });
+  check('重启后重送原批返回 200', resend.status === 200, `status=${resend.status}`);
+  check('重送命中幂等', resend.json.data.idempotentHit === true);
+  check('重送返回首次逐份回执（逐字段相同）', JSON.stringify(resend.json.data.receipt.items) === JSON.stringify(firstReceipt.items));
+  check('重送返回首次操作序号', resend.json.data.operationSeq === firstReceipt.operationSeq);
+  check('重送不改变状态序号', (await apiAt('GET', '/health')).json.seq === seqBeforeResend);
+
+  console.log('== 11. 同批号换内容：冲突 ==');
+  const conflict = await apiAt('POST', '/materials/batch', {
+    batchId: 'B-first',
+    items: [item('bat-e', 'e-batch-vertical.txt')],
+  });
+  check('同批号换内容返回 409', conflict.status === 409, `status=${conflict.status}`);
+  check('冲突时不改变状态序号', (await apiAt('GET', '/health')).json.seq === seqBeforeResend);
+  const x01Still = await apiAt('GET', '/intervals?cabinet=X-01');
+  check('冲突未污染规范表', x01Still.json.data.intervals.length === 2);
+
+  console.log('== 12. 校验期间并发批外订正：发布后保留该订正 ==');
+  // 先放一份批外材料 X-04（300/700）
+  await apiAt('POST', '/materials', {
+    materialId: 'mat-outside',
+    fileName: 'h-outside.txt',
+    mediaType: 'text/plain',
+    content: fixture('h-outside.txt'),
+  });
+  const seqBeforeConcurrent = (await apiAt('GET', '/health')).json.seq;
+  // 一个带校验暂停的批次：暂停期间并发提交批外订正（把 X-04 的 700 改为 800）
+  const pausedBatch = apiAt('POST', '/materials/batch', {
+    batchId: 'B-paused',
+    testPauseMs: 250,
+    items: [item('bat-e2', 'e-batch-vertical.txt')],
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  // 批次仍在解析/校验中：此时提交批外订正
+  const outsideCorr = await apiAt('POST', '/materials', {
+    materialId: 'mat-outside',
+    fileName: 'm1-outside-correct.txt',
+    mediaType: 'text/plain',
+    content: fixture('m1-outside-correct.txt'),
+    op: 'correct',
+  });
+  const pausedResult = await pausedBatch;
+  check('批次在批外订正之后完成发布', pausedResult.status === 200, `status=${pausedResult.status}`);
+  check('批外订正生成新版本 v2', outsideCorr.json.data.outcome.version === 2, `v=${outsideCorr.json.data.outcome.version}`);
+  const x04 = await apiAt('GET', '/intervals?cabinet=X-04');
+  check('发布后批外订正保留（X-04 增量为 300->800 = 500）', x04.json.data.intervals[0].delta === 500, String(x04.json.data.intervals[0].delta));
+  const outsideVersions = await apiAt('GET', '/materials?materialId=mat-outside');
+  check('批外订正版本 1 置 superseded、版本 2 active', outsideVersions.json.data.versions[0].status === 'superseded' && outsideVersions.json.data.versions[1].status === 'active');
+  check('批次发布与批外订正各占一条操作日志', pausedResult.json.data.operationSeq === seqBeforeConcurrent + 2, `seq=${pausedResult.json.data.operationSeq}`);
+
+  console.log('== 13. 批次内互为跨材料重复：复核按整批生效后重算 ==');
+  const dupSeq = (await apiAt('GET', '/health')).json.seq;
+  const dupBatch = await apiAt('POST', '/materials/batch', {
+    batchId: 'B-dup',
+    items: [item('bat-k1', 'k1-batch.txt'), item('bat-k2', 'k2-batch.txt')],
+  });
+  check('同柜同刻的两份材料可在同批发布', dupBatch.status === 200, `status=${dupBatch.status}`);
+  check('整批只占一条操作日志', dupBatch.json.data.operationSeq === dupSeq + 1);
+  const dupReviews = await apiAt('GET', '/reviews?status=pending&cabinet=Y-01');
+  check('同批重复被重算为待核（两份都标记）', dupReviews.json.data.reviews.filter((r: ReviewItem) => r.reason === 'duplicate-delivery').length >= 2, `n=${dupReviews.json.data.reviews.filter((r: ReviewItem) => r.reason === 'duplicate-delivery').length}`);
+
+  console.log('== 14. 重启后重送“含并发订正”的批次仍拿首次回执 ==');
+  const seqBeforeRestart2 = (await apiAt('GET', '/health')).json.seq;
+  restarted.server.close();
+  await new Promise((r) => restarted.server.on('close', r));
+  const again = await startServer(DATA, 0, '127.0.0.1');
+  const base3 = `http://127.0.0.1:${again.port}`;
+  const resend2 = await fetch(base3 + '/materials/batch', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      batchId: 'B-paused',
+      items: [item('bat-e2', 'e-batch-vertical.txt')],
+    }),
+  });
+  const resend2Json = await resend2.json();
+  check('再次重启后重送 B-paused 命中幂等', resend2.status === 200 && resend2Json.data.idempotentHit === true);
+  check('返回首次回执（操作序号一致）', resend2Json.data.operationSeq === pausedResult.json.data.operationSeq);
+  check('重启后状态序号不变', (await fetch(base3 + '/health').then((r) => r.json())).seq === seqBeforeRestart2);
+  again.server.close();
+}
+
+async function waitForPort(port: number, timeoutMs: number): Promise<void> {  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const r = await fetch(`http://127.0.0.1:${port}/health`);

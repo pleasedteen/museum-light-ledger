@@ -5,7 +5,7 @@ export type Layout = 'vertical' | 'horizontal' | 'unknown';
 export type Kind = 'reading' | 'meter-change';
 export type MaterialOp = 'ingest' | 'correct' | 'withdraw';
 export type MaterialStatus = 'active' | 'superseded' | 'withdrawn';
-export type ReviewState = 'pending' | 'confirmed' | 'corrected' | 'rejected';
+export type ReviewState = 'pending' | 'confirmed' | 'corrected' | 'rejected' | 'superseded';
 export type IntervalStatus = 'ok' | 'pending-review' | 'anomaly';
 
 /** 原文中的一个单元格/字段，保留可追溯位置 */
@@ -123,10 +123,55 @@ export interface StoredRecord {
   active: boolean;
 }
 
+/** 批量送达中的一份材料 */
+export interface BatchItemRequest {
+  materialId: string;
+  fileName: string;
+  mediaType?: string;
+  content: string;
+  op?: MaterialOp;
+}
+
+/** 批量发布后逐份回执（首次发布的回执会被持久化并原样重放） */
+export interface BatchItemReceipt {
+  index: number;
+  materialId: string;
+  fileName: string;
+  op: MaterialOp;
+  version: number;
+  idempotentHit: boolean;
+  recordKeys: string[];
+  layout: Layout;
+  candidateCount: number;
+}
+
+/** 一份批次回执：批号 + 内容哈希 + 逐份结果，重启后仍在 */
+export interface BatchReceipt {
+  batchId: string;
+  contentHash: string;
+  itemCount: number;
+  receivedAt: number;
+  publishedAt: number;
+  operationSeq: number;
+  outcome: 'published';
+  items: BatchItemReceipt[];
+}
+
+/** 整批被拒绝时逐份给出失败原因（不落库） */
+export interface BatchItemFailure {
+  index: number;
+  materialId: string;
+  fileName: string;
+  op: MaterialOp;
+  errorCode: string;
+  errorDetail: string;
+}
+
 export interface OperationRecord {
   seq: number;
-  op: MaterialOp | 'review' | 'reset-counters';
+  op: MaterialOp | 'review' | 'batch' | 'reset-counters';
   materialId?: string;
+  batchId?: string;
   version?: number;
   clientToken?: string;
   appliedAt: number;
@@ -143,6 +188,8 @@ export interface State {
   reviews: Record<string, ReviewItem>;
   /** 每柜按时刻排序的轻量索引 */
   timeline: Record<string, TimelineEntry[]>;
+  /** 已发布批次回执：批号 -> 首次逐份回执（重启后用于重送幂等重放） */
+  batches: Record<string, BatchReceipt>;
   operations: OperationRecord[];
   counters: AccessCounters;
 }

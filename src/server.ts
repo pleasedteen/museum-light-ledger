@@ -1,6 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { type AddressInfo } from 'node:net';
-import { appendFileSync, fsyncSync, openSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseHtml } from './parse-html.js';
 import { parseText } from './parse-text.js';
@@ -9,6 +8,8 @@ import {
   applyMaterial,
   applyReviewDecision,
   findIdempotent,
+  firstCommitSeq,
+  type IngestOutcome,
   type IngestRequest,
   type ReviewDecision,
 } from './ingest.js';
@@ -18,6 +19,8 @@ import { hashString } from './parse-utils.js';
 
 export interface AppContext {
   store: Store;
+  /** 故障注入端点（/test/*）仅在测试显式开启时注册 */
+  faultInjection?: boolean;
 }
 
 interface JsonResponse {
@@ -88,15 +91,23 @@ export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: 
       const state = store.getState();
       const idem = findIdempotent(state, body);
       if (idem) {
-        const outcome = {
+        // 重复送达：返回首次提交的序号与版本；已撤回版本保持撤回，不产生新提交
+        const outcome: IngestOutcome = {
           materialId: idem.materialId,
           version: idem.version,
           op: idem.op,
           idempotentHit: true,
+          operationSeq: firstCommitSeq(state, idem),
+          materialStatus: idem.status,
           recordKeys: idem.recordKeys,
           newReviewIds: [],
+          activeRecordCount: idem.recordKeys.filter((k) => state.records[k]?.active).length,
         };
-        return send(res, 200, wrap(store, { outcome, parse: summarizeParse(parsed) }));
+        return send(
+          res,
+          200,
+          wrap(store, { operationSeq: outcome.operationSeq, outcome, parse: summarizeParse(parsed) }),
+        );
       }
       let outcome: import('./ingest.js').IngestOutcome | null = null;
       const opRec = store.commit(
@@ -227,19 +238,14 @@ export async function handleRequest(ctx: AppContext, req: IncomingMessage, res: 
       return send(res, 200, wrap(store, { operationSeq: opRec.seq, counters: store.getCounters() }));
     }
 
-    // ---------- 测试用故障注入：在日志写入中途退出 ----------
+    // ---------- 测试用故障注入：在日志写入中途退出（仅测试显式开启时注册） ----------
     if (method === 'POST' && path === '/test/crash-during-write') {
-      const state = store.getState();
-      const draft = structuredClone(state);
-      draft.seq += 1;
-      const line = JSON.stringify({ seq: draft.seq, type: 'operation', state: draft }) + '\n';
+      if (!ctx.faultInjection) return send(res, 404, { error: `not found: ${method} ${path}` });
       res.writeHead(202, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ crashing: true }));
       setImmediate(() => {
         // 只写半条然后硬退出，模拟写入中断
-        const fd = openSync((store as unknown as { journalPath: string }).journalPath, 'a');
-        appendFileSync(fd, line.slice(0, Math.max(1, Math.floor(line.length / 3))));
-        fsyncSync(fd);
+        store.simulateInterruptedWrite();
         process.exit(17);
       });
       return;
@@ -278,10 +284,15 @@ function wrap(store: Store, payload: unknown): { data: unknown; access: { perReq
   };
 }
 
-export function startServer(dataDir: string, port = 0, host = '127.0.0.1'): Promise<{ server: Server; port: number; store: Store }> {
+export function startServer(
+  dataDir: string,
+  port = 0,
+  host = '127.0.0.1',
+  opts: { faultInjection?: boolean } = {},
+): Promise<{ server: Server; port: number; store: Store }> {
   const store = new Store(dataDir);
   const server = createServer((req, res) => {
-    handleRequest({ store }, req, res).catch((err) => {
+    handleRequest({ store, faultInjection: opts.faultInjection === true }, req, res).catch((err) => {
       send(res, 500, { error: (err as Error).message });
     });
   });
@@ -306,8 +317,17 @@ if (isMain) {
   const dataDir = process.argv[2] ?? join(process.cwd(), 'data');
   const port = Number(process.argv[3] ?? process.env.PORT ?? 8080);
   const host = process.argv[4] ?? process.env.HOST ?? '127.0.0.1';
-  startServer(dataDir, port, host).then(({ port: actual }) => {
-    console.log(`[museum-light-ledger] 数据目录: ${dataDir}`);
-    console.log(`[museum-light-ledger] 监听: http://${host}:${actual}`);
-  });
+  // 故障注入端点仅供测试：需显式设置 MLL_FAULT_INJECTION=1 才注册
+  const faultInjection = process.env.MLL_FAULT_INJECTION === '1';
+  (async () => {
+    try {
+      const { port: actual } = await startServer(dataDir, port, host, { faultInjection });
+      console.log(`[museum-light-ledger] 数据目录: ${dataDir}`);
+      console.log(`[museum-light-ledger] 监听: http://${host}:${actual}`);
+    } catch (err) {
+      // 含 JournalRecoveryError：提交顺序无法确认，原日志已保留，需人工核对
+      console.error(`[museum-light-ledger] 启动失败：${(err as Error).message}`);
+      process.exitCode = 1;
+    }
+  })();
 }

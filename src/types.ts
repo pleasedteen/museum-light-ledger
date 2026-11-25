@@ -108,6 +108,8 @@ export interface MaterialInfo {
   parentVersion: number | null;
   receivedAt: number;
   contentHash: string;
+  /** 首次提交该版本的操作序号（补发同材料+动作+内容时原样返回） */
+  createdSeq?: number;
   recordKeys: string[];
 }
 

@@ -6,6 +6,8 @@ import {
   renameSync,
   writeFileSync,
   fsyncSync,
+  fstatSync,
+  readSync,
   openSync,
   closeSync,
   appendFileSync,
@@ -40,6 +42,66 @@ interface JournalEntry {
   type: 'operation';
   /** 完整状态快照（足够小，单条操作只动少量记录） */
   state: State;
+}
+
+/** 日志恢复失败：提交顺序无法确认。原文件保持不动，需人工核对修复。 */
+export class JournalRecoveryError extends Error {
+  readonly journalPath: string;
+  readonly detail: string;
+  constructor(journalPath: string, detail: string) {
+    super(`日志恢复失败：${detail}（${journalPath} 已原样保留，请人工核对）`);
+    this.name = 'JournalRecoveryError';
+    this.journalPath = journalPath;
+    this.detail = detail;
+  }
+}
+
+interface JournalHit {
+  entry: JournalEntry;
+  /** 解析成功的原始片段（用于完全重复行去重） */
+  payload: string;
+}
+
+function isValidJournalEntry(x: unknown): x is JournalEntry {
+  const e = x as JournalEntry | null;
+  return (
+    !!e &&
+    typeof e === 'object' &&
+    e.type === 'operation' &&
+    Number.isInteger(e.seq) &&
+    e.seq >= 1 &&
+    !!e.state &&
+    typeof e.state === 'object' &&
+    (e.state as State).seq === e.seq
+  );
+}
+
+/** 解析一整行日志；半条（断写残尾）或结构不符返回 null */
+function parseJournalEntry(line: string): JournalHit | null {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    return isValidJournalEntry(parsed) ? { entry: parsed, payload: line } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 旧版断写会把下一条提交直接粘在残尾后（残尾无换行），从行内定位并
+ * 提取完整写入的条目；候选不唯一时放弃提取（顺序无法确认，交给上层报错）。
+ */
+function extractGluedEntry(line: string): JournalHit | null {
+  let hit: JournalHit | null = null;
+  let from = line.indexOf('{"seq":');
+  while (from >= 0) {
+    const candidate = parseJournalEntry(line.slice(from));
+    if (candidate) {
+      if (hit) return null; // 多个可行候选，无法确认哪条是真提交
+      hit = candidate;
+    }
+    from = line.indexOf('{"seq":', from + 1);
+  }
+  return hit;
 }
 
 /**
@@ -85,22 +147,52 @@ export class Store {
     }
     this.journalEntries = 0;
     if (existsSync(this.journalPath)) {
-      const lines = readFileSync(this.journalPath, 'utf8').split('\n').filter((l) => l.trim() !== '');
-      for (const line of lines) {
-        let entry: JournalEntry;
-        try {
-          entry = JSON.parse(line) as JournalEntry;
-        } catch {
-          // 日志尾部半条（写入中断）：停止重放，前面已 fsync 的完整条目保留
-          break;
-        }
-        if (entry.type === 'operation' && entry.seq > state.seq) {
-          state = entry.state;
-          this.journalEntries += 1;
-        }
-      }
+      state = this.replayJournal(state);
     }
     return state;
+  }
+
+  /**
+   * 重放操作日志（只读，绝不改写原文件）：
+   *  - 断写留下的残尾（半条 JSON）整段跳过；
+   *  - 残尾之后已完整写入的提交照常找回——包括旧版把新条目直接粘在
+   *    残尾后（残尾无换行）的情形，从行内提取完整条目；
+   *  - 找回的提交序号必须与快照逐一衔接、互不冲突；无法确认顺序时
+   *    抛 JournalRecoveryError，原文件保持不动。
+   */
+  private replayJournal(snapshotState: State): State {
+    const raw = readFileSync(this.journalPath, 'utf8');
+    const baseSeq = snapshotState.seq;
+    const accepted: JournalEntry[] = [];
+    const seenPayload = new Set<string>();
+
+    for (const segment of raw.split('\n')) {
+      const line = segment.trim();
+      if (line === '') continue;
+      const hit = parseJournalEntry(line) ?? extractGluedEntry(line);
+      if (!hit) continue; // 残尾：写入中断的半条，跳过
+      if (seenPayload.has(hit.payload)) continue; // 完全相同的重复行
+      seenPayload.add(hit.payload);
+      if (hit.entry.seq <= baseSeq) continue; // 快照已覆盖的旧条目
+      accepted.push(hit.entry);
+    }
+
+    // 顺序确认：序号必须恰好逐一递增，否则存在丢失或冲突的提交
+    let expected = baseSeq;
+    for (const entry of accepted) {
+      if (entry.seq !== expected + 1) {
+        throw new JournalRecoveryError(
+          this.journalPath,
+          entry.seq <= expected
+            ? `序号 ${entry.seq} 与已确认的提交 ${expected} 冲突`
+            : `序号由 ${expected} 直接跳到 ${entry.seq}，中间提交无法确认`,
+        );
+      }
+      expected = entry.seq;
+    }
+
+    this.journalEntries = accepted.length;
+    return accepted.length ? accepted[accepted.length - 1]!.state : snapshotState;
   }
 
   getState(): State {
@@ -281,9 +373,18 @@ export class Store {
 
     const entry: JournalEntry = { seq: draft.seq, type: 'operation', state: draft };
     const line = JSON.stringify(entry) + '\n';
-    const fd = openSync(this.journalPath, 'a');
+    const fd = openSync(this.journalPath, 'a+');
     try {
-      appendFileSync(fd, line);
+      // 上次断写可能留下未换行的残尾：先补换行将其终止，
+      // 避免新提交与残尾粘连成不可解析的一行（粘连会导致后续重放丢失提交）
+      const size = fstatSync(fd).size;
+      let prefix = '';
+      if (size > 0) {
+        const tail = Buffer.alloc(1);
+        readSync(fd, tail, 0, 1, size - 1);
+        if (tail[0] !== 0x0a) prefix = '\n';
+      }
+      appendFileSync(fd, prefix + line);
       fsyncSync(fd);
     } finally {
       closeSync(fd);
@@ -313,6 +414,24 @@ export class Store {
   }
 
   // ---- 测试/运维辅助 ----
+
+  /**
+   * 仅供测试的故障注入：把下一条日志项写到一半即返回（不带换行、
+   * 不推进内存状态），模拟“写入中断”。正常请求路径不得调用。
+   */
+  simulateInterruptedWrite(): void {
+    const draft = structuredClone(this.state);
+    draft.seq += 1;
+    const entry: JournalEntry = { seq: draft.seq, type: 'operation', state: draft };
+    const line = JSON.stringify(entry) + '\n';
+    const fd = openSync(this.journalPath, 'a');
+    try {
+      appendFileSync(fd, line.slice(0, Math.max(1, Math.floor(line.length / 3))));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
 
   listFiles(): string[] {
     return readdirSync(this.dir).sort();

@@ -2,6 +2,7 @@ import type {
   CandidateRecord,
   MaterialInfo,
   MaterialOp,
+  MaterialStatus,
   ParsedCandidate,
   ParseResult,
   ReviewItem,
@@ -25,17 +26,31 @@ export interface IngestOutcome {
   version: number;
   op: MaterialOp;
   idempotentHit: boolean;
+  /** 首次提交该版本的操作序号（幂等命中时为首次送达的那次提交） */
+  operationSeq: number | null;
+  /** 命中版本当前的材料状态（已撤回不因补发而复活） */
+  materialStatus: MaterialStatus;
   recordKeys: string[];
   newReviewIds: string[];
   activeRecordCount: number;
 }
 
-/** 判断是否为重复送达：同材料 + 同内容哈希，已处理过则直接幂等返回 */
+/**
+ * 判断是否为重复送达：同材料 + 同动作(op) + 同内容哈希。
+ * 已撤回版本同样命中——补发只返回首次提交的序号与版本，不改变撤回状态。
+ */
 export function findIdempotent(state: State, req: IngestRequest): MaterialInfo | null {
   const versions = state.materials[req.materialId];
   if (!versions) return null;
   const hash = hashString(`${req.op ?? 'ingest'}|${req.content}`);
-  return versions.find((m) => m.contentHash === hash && m.status !== 'withdrawn') ?? null;
+  return versions.find((m) => m.contentHash === hash) ?? null;
+}
+
+/** 该版本首次落账的操作序号；老台账缺 createdSeq 字段时从操作日志回查 */
+export function firstCommitSeq(state: State, m: MaterialInfo): number | null {
+  if (typeof m.createdSeq === 'number') return m.createdSeq;
+  const op = state.operations.find((o) => o.materialId === m.materialId && o.op === m.op);
+  return op ? op.seq : null;
 }
 
 function toSourceRef(m: MaterialInfo, cand: ParsedCandidate): SourceRef {
@@ -197,6 +212,8 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
       version: idem.version,
       op: idem.op,
       idempotentHit: true,
+      operationSeq: firstCommitSeq(draft, idem),
+      materialStatus: idem.status,
       recordKeys: idem.recordKeys,
       newReviewIds: [],
       activeRecordCount: idem.recordKeys.filter((k) => draft.records[k]?.active).length,
@@ -206,6 +223,8 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
   const op: MaterialOp = req.op ?? 'ingest';
   const priorVersions = draft.materials[req.materialId] ?? [];
   const version = priorVersions.length === 0 ? 1 : Math.max(...priorVersions.map((m) => m.version)) + 1;
+  // commit 将在变更完成后自增 seq，本次提交的序号即 draft.seq + 1
+  const pendingSeq = draft.seq + 1;
 
   const info: MaterialInfo = {
     materialId: req.materialId,
@@ -218,6 +237,7 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
     parentVersion: priorVersions.length ? Math.max(...priorVersions.map((m) => m.version)) : null,
     receivedAt: Date.now(),
     contentHash: hashString(`${op}|${req.content}`),
+    createdSeq: pendingSeq,
     recordKeys: [],
   };
 
@@ -299,6 +319,8 @@ export function applyMaterial(store: Store, draft: State, req: IngestRequest, pa
     version,
     op,
     idempotentHit: false,
+    operationSeq: pendingSeq,
+    materialStatus: info.status,
     recordKeys,
     newReviewIds,
     activeRecordCount: recordKeys.filter((k) => draft.records[k]?.active).length,
